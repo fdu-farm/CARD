@@ -45,8 +45,7 @@ ARTIFACT_TRANSFORMS = {
     'Spike': tio.RandomSpike,
 }
 
-# Source-validation response/noise augmentation. This protocol is independent of the
-# ACDC-C Bias/Motion/Ghosting/Spike transforms above.
+# Source-validation photometric augmentation.
 SOURCE_VALIDATION_AUGMENTATION = 'SourceValidationAugmentation'
 
 PHOTOMETRIC_PRESETS = {
@@ -95,7 +94,6 @@ class ACDC_C_TorchIO_Dataset(ACDC_nnUNet_Dataset):
         split_config=None,
         photometric_preset='source_validation_medium',
         photometric_ops='all',
-        **kwargs
     ):
         self.corruption_type = corruption_type
         self.severity = float(severity)
@@ -147,63 +145,9 @@ class ACDC_C_TorchIO_Dataset(ACDC_nnUNet_Dataset):
         if mode == 'test':
             if not hasattr(self, 'slice_mapping') or len(self.slice_mapping) == 0:
                 self._scan_slices()
-        self._apply_scout_subset(
-            max_cases=kwargs.get('max_cases', None),
-            case_offset=kwargs.get('case_offset', 0),
-            max_slices_per_case=kwargs.get('max_slices_per_case', None),
-            max_slices=kwargs.get('max_slices', None),
-        )
 
     def __len__(self):
         return len(self.slice_mapping)
-
-    @staticmethod
-    def _optional_int(value):
-        if value is None or value == "":
-            return None
-        return int(value)
-
-    def _apply_scout_subset(
-        self,
-        *,
-        max_cases=None,
-        case_offset=0,
-        max_slices_per_case=None,
-        max_slices=None,
-    ):
-        """Optionally restrict source-val evaluation for fast scouting.
-
-        Full source-validation runs leave these fields unset.  Smaller values
-        can be passed through Hydra for a deterministic diagnostic subset
-        before running the complete source-validation cache.
-        """
-        max_cases = self._optional_int(max_cases)
-        case_offset = int(case_offset or 0)
-        max_slices_per_case = self._optional_int(max_slices_per_case)
-        max_slices = self._optional_int(max_slices)
-        if max_cases is None and max_slices_per_case is None and max_slices is None and case_offset == 0:
-            return
-
-        if max_cases is not None or case_offset:
-            start = max(0, case_offset)
-            stop = None if max_cases is None else start + max_cases
-            self.file_names = self.file_names[start:stop]
-
-        # Rebuild slice_mapping after any case filtering, then optionally
-        # retain only the first K slices per selected case.
-        self.slice_mapping = []
-        self._scan_slices()
-        if max_slices_per_case is not None:
-            per_case_counts = {}
-            filtered = []
-            for case_idx, slice_idx in self.slice_mapping:
-                used = per_case_counts.get(case_idx, 0)
-                if used < max_slices_per_case:
-                    filtered.append((case_idx, slice_idx))
-                    per_case_counts[case_idx] = used + 1
-            self.slice_mapping = filtered
-        if max_slices is not None:
-            self.slice_mapping = self.slice_mapping[:max_slices]
 
     def __getitem__(self, index):
         # Get clean data from parent
@@ -216,9 +160,7 @@ class ACDC_C_TorchIO_Dataset(ACDC_nnUNet_Dataset):
         if mask.ndim == 3:
             mask = mask.unsqueeze(0)
 
-        # Structural ACDC-C artifacts use one deterministic seed per full case
-        # volume; source-validation photometric augmentation keeps the legacy
-        # (case_idx, slice_idx) seed below.
+        # Volume-level seed for 3D artifacts; slice-level seed for photometric transforms.
         artifact_mode = self.artifact_transform is not None
         item_seed = (
             self.base_seed + case_idx

@@ -34,8 +34,6 @@ done
 "${PYTHON_BIN}" "${PACKAGE_ROOT}/evaluation/assemble_selected_tuples.py" \
   --cardiac "${SELECTION_RESULT}" --output "${TUPLES_FILE}"
 mkdir -p "${OUT_ROOT}/metrics" "${OUT_ROOT}/logs"
-MAX_CASE_ARGS=()
-[[ -n "${MAX_CASES:-}" ]] && MAX_CASE_ARGS+=(--max-cases "${MAX_CASES}")
 
 run_block() {
   local block="$1"
@@ -50,17 +48,13 @@ run_block() {
     --reference-checkpoint "${REFERENCE_CHECKPOINT}" \
     --tuples-file "${TUPLES_FILE}" --output-dir "${OUT_ROOT}/metrics/${block}" \
     --batch-size "${BATCH_SIZE:-16}" --num-workers "${NUM_WORKERS:-12}" \
-    "${MAX_CASE_ARGS[@]}" 2>&1 | tee "${OUT_ROOT}/logs/${block}.log"
+    2>&1 | tee "${OUT_ROOT}/logs/${block}.log"
 }
 
 run_block acdc-c
 run_block mnm
 
-if [[ -z "${MAX_CASES:-}" ]]; then
-  "${PYTHON_BIN}" "${PACKAGE_ROOT}/evaluation/collect_results.py" \
-    "${OUT_ROOT}"/metrics/*/per_case_metrics.csv --output-dir "${OUT_ROOT}/summary"
-else
-  echo "Partial test complete; aggregation skipped because MAX_CASES is set."
-fi
+"${PYTHON_BIN}" "${PACKAGE_ROOT}/evaluation/collect_results.py" \
+  "${OUT_ROOT}"/metrics/*/per_case_metrics.csv --output-dir "${OUT_ROOT}/summary"
 
 echo "Evaluation complete: ${OUT_ROOT}"

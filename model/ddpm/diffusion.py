@@ -3,6 +3,7 @@
 import copy
 import gc
 import math
+import random
 from pathlib import Path
 
 import numpy as np
@@ -12,7 +13,6 @@ from torch import nn
 import torch.nn.functional as F
 from torch.cuda.amp import GradScaler, autocast
 from torch.optim import Adam
-from torch.utils.tensorboard import SummaryWriter
 
 from utils.metrics_seg import DiceMetric as SegDiceMetric
 
@@ -58,6 +58,7 @@ class Trainer(object):
         ema_decay=0.995,
         train_lr=1e-4,
         train_num_steps=100000,
+        lr_schedule_total_steps=None,
         gradient_accumulate_every=1,
         amp=False,
         step_start_ema=200,
@@ -70,10 +71,14 @@ class Trainer(object):
         lr_decay=True,
         warmup_steps=1000,
         min_lr=None,
-        test_callback=None,
         cfg_enabled=False,
         p_uncond=0.1,
         validation_loader=None,
+        source_validation_loaders=None,
+        early_stopping_enabled=False,
+        early_stopping_patience=10,
+        early_stopping_min_delta=0.001,
+        early_stopping_min_updates=25000,
         log_dir=None,
     ):
         super().__init__()
@@ -89,6 +94,9 @@ class Trainer(object):
 
         self.gradient_accumulate_every = gradient_accumulate_every
         self.train_num_steps = train_num_steps
+        self.lr_schedule_total_steps = (
+            int(lr_schedule_total_steps) if lr_schedule_total_steps is not None else int(train_num_steps)
+        )
         self.cfg = cfg
         self.diffusion_type = getattr(cfg.model, 'diffusion_type', 'categorical').lower()
         if self.diffusion_type != 'categorical':
@@ -97,6 +105,7 @@ class Trainer(object):
         self.categorical_ignore_index = int(getattr(cfg.model, 'categorical_ignore_index', -1))
         self.dl = cycle(dataset)
         self.val_dl = validation_loader
+        self.source_val_loaders = list(source_validation_loaders) if source_validation_loaders else None
 
         # Distributed setup
         self.is_distributed = is_distributed
@@ -109,6 +118,13 @@ class Trainer(object):
         self.dice_metric = SegDiceMetric(self.metric_num_classes)
         self.best_val_dice = -float('inf')
         self.last_val_metrics = None
+        self.early_stopping_enabled = bool(early_stopping_enabled)
+        self.early_stopping_patience = int(early_stopping_patience)
+        self.early_stopping_min_delta = float(early_stopping_min_delta)
+        self.early_stopping_min_updates = int(early_stopping_min_updates)
+        self.stopping_best_dice = None
+        self.bad_evaluations = 0
+        self.should_stop_early = False
         self.eval_sampler = str(getattr(cfg.model, 'sampler', 'categorical')).lower()
         self.eval_sampling_steps = getattr(cfg.model, 'sampling_steps', None)
         self.eval_final_step_mode = getattr(cfg.model, 'categorical_final_step_mode', 'majority')
@@ -124,7 +140,7 @@ class Trainer(object):
             self.scheduler = WarmupCosineAnnealingLR(
                 self.opt,
                 warmup_steps=warmup_steps,
-                total_steps=train_num_steps,
+                total_steps=self.lr_schedule_total_steps,
                 min_lr=self.min_lr
             )
         else:
@@ -147,12 +163,13 @@ class Trainer(object):
         log_dir_path.mkdir(parents=True, exist_ok=True)
         self.log_dir = log_dir_path
         if not self.is_distributed or self.rank == 0:
-            self.writer = SummaryWriter(log_dir=str(log_dir_path))
+            try:
+                from torch.utils.tensorboard import SummaryWriter
+                self.writer = SummaryWriter(log_dir=str(log_dir_path))
+            except ImportError:
+                self.writer = None
         else:
             self.writer = None
-
-        # Add test callback
-        self.test_callback = test_callback
 
         self.cfg_enabled = cfg_enabled
         self.p_uncond = p_uncond
@@ -190,7 +207,11 @@ class Trainer(object):
             'model': self.model.state_dict(),
             'ema': self.ema_model.state_dict(),
             'scaler': self.scaler.state_dict(),
-            'scheduler': self.scheduler.state_dict() if self.scheduler is not None else None
+            'scheduler': self.scheduler.state_dict() if self.scheduler is not None else None,
+            'best_val_dice': self.best_val_dice,
+            'best_val_step': self.best_val_step,
+            'stopping_best_dice': self.stopping_best_dice,
+            'bad_evaluations': self.bad_evaluations,
         }
 
         # Save latest checkpoint
@@ -226,23 +247,14 @@ class Trainer(object):
         self.scaler.load_state_dict(data['scaler'])
         if self.scheduler is not None and data.get('scheduler') is not None:
             self.scheduler.load_state_dict(data['scheduler'])
-
-    def _prepare_callback_batch(self, image, label, data, prediction=None):
-        callback_batch = {
-            'image': image.detach().cpu().clone(),
-            'segmentation': label.detach().cpu().clone()
-        }
-
-        if prediction is not None:
-            callback_batch['prediction'] = prediction.detach().cpu().clone()
-
-        if 'name' in data:
-            callback_batch['name'] = list(data['name'])
-
-        if 'affine' in data and data['affine'] is not None:
-            callback_batch['affine'] = data['affine'].detach().cpu().clone()
-
-        return callback_batch
+        if 'best_val_dice' in data:
+            self.best_val_dice = data['best_val_dice']
+        if 'best_val_step' in data:
+            self.best_val_step = data['best_val_step']
+        if 'stopping_best_dice' in data:
+            self.stopping_best_dice = data['stopping_best_dice']
+        if 'bad_evaluations' in data:
+            self.bad_evaluations = data['bad_evaluations']
 
     def _forward_diffusion(self, image, mask_sdf, label, categorical_mask, **kwargs):
         if categorical_mask is None:
@@ -256,68 +268,11 @@ class Trainer(object):
             **kwargs,
         )
 
-    def _invoke_test_callback(self, milestone, callback_batch, reason):
-        if (self.test_callback is None or callback_batch is None or
-                (self.is_distributed and self.rank != 0)):
-            return
-
-        self.test_callback.on_checkpoint(
-            ema_model=self.ema_model,
-            batch=callback_batch,
-            milestone=milestone,
-            results_folder=str(self.results_folder),
-            reason=reason
-        )
-
     def _log_train_metrics(self, loss_value: float, lr_value: float) -> None:
         if self.writer is None:
             return
         self.writer.add_scalar('train/loss', loss_value, self.step)
         self.writer.add_scalar('train/lr', lr_value, self.step)
-
-    def _log_validation_visuals(self, callback_batch, global_step: int) -> None:
-        if self.writer is None or callback_batch is None:
-            return
-
-        image = callback_batch['image'][0, 0].float()
-
-        def _normalize_slice(slice_tensor: torch.Tensor) -> torch.Tensor:
-            slice_min = slice_tensor.min()
-            slice_max = slice_tensor.max()
-            denom = (slice_max - slice_min).clamp(min=1e-6)
-            return ((slice_tensor - slice_min) / denom).unsqueeze(0)
-
-        # Handle 2D (H, W) and 3D (D, H, W) images
-        if image.ndim == 2:
-            # 2D mode: image is already (H, W)
-            image_slice = _normalize_slice(image)
-            slice_idx = 0
-        else:
-            # 3D mode: image is (D, H, W)
-            depth = int(image.shape[0])
-            slice_idx = max(0, depth // 2)
-            image_slice = _normalize_slice(image[slice_idx])
-
-        self.writer.add_image('val/image', image_slice, global_step)
-
-        denom = max(1, self.num_classes)
-        seg = callback_batch['segmentation'][0, 0].float()
-        if seg.ndim == 2:
-            # 2D mode
-            gt_slice = seg.unsqueeze(0) / denom
-        else:
-            # 3D mode
-            gt_slice = seg[slice_idx].unsqueeze(0) / denom
-        self.writer.add_image('val/gt', gt_slice, global_step)
-
-        pred = callback_batch.get('prediction')
-        if pred is not None:
-            pred_tensor = pred[0, 0].float()
-            if pred_tensor.ndim == 2:
-                pred_slice = pred_tensor.unsqueeze(0) / denom
-            else:
-                pred_slice = pred_tensor[slice_idx].unsqueeze(0) / denom
-            self.writer.add_image('val/pred', pred_slice, global_step)
 
     def _log_validation_metrics(self, metrics, global_step: int) -> None:
         """Log validation metrics to TensorBoard."""
@@ -325,11 +280,9 @@ class Trainer(object):
             return
 
         for key, value in metrics.items():
-            if key not in ('callback_batch', 'ckpt_batch') and value is not None:
+            if value is not None:
                 if not (isinstance(value, float) and math.isnan(value)):
                     self.writer.add_scalar(f'val/{key}', value, global_step)
-
-        self._log_validation_visuals(metrics.get('callback_batch'), global_step)
 
     def _compute_dice(self, pred_seg: torch.Tensor, gt_seg: torch.Tensor):
         if pred_seg is None or gt_seg is None:
@@ -407,7 +360,91 @@ class Trainer(object):
             return float(values[valid].mean().item())
         return None
 
+    def _evaluate_source_conditions(self):
+        if not self.source_val_loaders or (self.is_distributed and self.rank != 0):
+            return None
+
+        py_state = random.getstate()
+        np_state = np.random.get_state()
+        cpu_rng = torch.get_rng_state()
+        cuda_rng = torch.cuda.get_rng_state_all() if torch.cuda.is_available() else None
+
+        device = next(self.model.parameters()).device
+        was_training = self.model.training
+        was_ema_training = self.ema_model.training
+        self.model.eval()
+        self.ema_model.eval()
+
+        condition_dices: list[float] = []
+        max_val_batches = getattr(self, 'max_val_batches', None)
+
+        try:
+            with torch.no_grad():
+                for cond_name, loader in self.source_val_loaders:
+                    slice_values: list[float] = []
+                    for batch_idx, batch in enumerate(loader):
+                        if max_val_batches is not None and batch_idx >= max_val_batches:
+                            break
+                        image = batch['image'].to(device, non_blocking=True)
+                        label = batch['segmentation'].to(device, non_blocking=True)
+                        categorical_mask = batch.get('categorical_mask')
+                        if categorical_mask is not None:
+                            categorical_mask = categorical_mask.to(device, non_blocking=True)
+                        else:
+                            categorical_mask = label
+
+                        if image.ndim == 5 and image.shape[2] == 1:
+                            image = image.squeeze(2)
+                        if label.ndim == 5 and label.shape[2] == 1:
+                            label = label.squeeze(2)
+                        if categorical_mask.ndim == 5 and categorical_mask.shape[2] == 1:
+                            categorical_mask = categorical_mask.squeeze(2)
+
+                        preds_seg = self.ema_model.sample(
+                            batch_size=image.shape[0],
+                            cond_scale=1.0,
+                            proc=False,
+                            channel_cond=image,
+                            sampler=self.eval_sampler,
+                            num_steps=self.eval_sampling_steps,
+                            final_step_mode=self.eval_final_step_mode,
+                        )
+                        yy = torch.where(label == self.categorical_ignore_index, 0, label)
+                        if yy.ndim == 3:
+                            yy = yy.unsqueeze(1)
+                        dices = self.dice_metric(preds_seg, yy)[:, 1:]
+                        slice_values.extend(dices.double().mean(dim=1).cpu().tolist())
+                    if slice_values:
+                        cond_dice = float(sum(slice_values) / len(slice_values))
+                        condition_dices.append(cond_dice)
+                        if not self.is_distributed or self.rank == 0:
+                            print(f"  [{cond_name}] dice={cond_dice:.4f} ({len(slice_values)} slices)")
+        finally:
+            if was_training:
+                self.model.train()
+            if was_ema_training:
+                self.ema_model.train()
+            random.setstate(py_state)
+            np.random.set_state(np_state)
+            torch.set_rng_state(cpu_rng)
+            if cuda_rng is not None:
+                torch.cuda.set_rng_state_all(cuda_rng)
+
+        if not condition_dices:
+            return None
+
+        mean_dice = float(sum(condition_dices) / len(condition_dices))
+        if not self.is_distributed or self.rank == 0:
+            print(f"Validation step {self.step + 1}: four-condition mean dice={mean_dice:.4f}\n")
+        return {
+            'loss': None,
+            'dice': mean_dice,
+            'hd95': None,
+        }
+
     def _evaluate_validation(self):
+        if self.source_val_loaders is not None:
+            return self._evaluate_source_conditions()
         if self.val_dl is None or (self.is_distributed and self.rank != 0):
             return None
 
@@ -427,8 +464,6 @@ class Trainer(object):
         total_batches = 0
         dice_values: list[float] = []
         hd95_values: list[float] = []
-        callback_batch = None
-        ckpt_batch = None
 
         with torch.no_grad():
             for batch_idx, batch in enumerate(self.val_dl):
@@ -485,17 +520,6 @@ class Trainer(object):
                 if hd95_val is not None and not math.isnan(hd95_val):
                     hd95_values.append(hd95_val)
 
-                if callback_batch is None:
-                    callback_batch = self._prepare_callback_batch(
-                        image, label, batch, prediction=preds_seg
-                    )
-                    ckpt_mask = categorical_mask.detach().clone()
-                    ckpt_batch = (
-                        image.detach().clone(),
-                        ckpt_mask,
-                        label.detach().clone()
-                    )
-
         if was_training:
             self.model.train()
         if was_ema_training:
@@ -516,8 +540,6 @@ class Trainer(object):
             'loss': avg_loss,
             'dice': mean_dice,
             'hd95': mean_hd95,
-            'callback_batch': callback_batch,
-            'ckpt_batch': ckpt_batch,
         }
 
     def _handle_validation_results(self, metrics, global_step: int) -> None:
@@ -542,17 +564,23 @@ class Trainer(object):
                 if not self.is_distributed or self.rank == 0:
                     print(f'Saved new best Dice checkpoint to {self.best_checkpoint_path}')
 
-    def _run_checkpoint(self, milestone, callback_batch, image, mask, label, reason):
+            if self.early_stopping_enabled:
+                if (
+                    self.stopping_best_dice is None
+                    or dice_value >= self.stopping_best_dice + self.early_stopping_min_delta
+                ):
+                    self.stopping_best_dice = dice_value
+                    self.bad_evaluations = 0
+                else:
+                    self.bad_evaluations += 1
+                if (
+                    global_step >= self.early_stopping_min_updates
+                    and self.bad_evaluations >= self.early_stopping_patience
+                ):
+                    self.should_stop_early = True
+
+    def _run_checkpoint(self, milestone):
         self.save(milestone)
-
-        self._invoke_test_callback(milestone, callback_batch, reason)
-
-        self.model.test(
-            image,
-            mask,
-            label=label,
-            milestone=milestone,
-        )
         gc.collect()
         torch.cuda.empty_cache()
 
@@ -623,7 +651,6 @@ class Trainer(object):
                         print(f'{self.step}: {loss.item():.4f}, lr: {current_lr:.2e}{warmup_info}, config: {str(self.results_folder).split("/")[-1]}')
 
             log = {'loss': loss.item(), 'lr': current_lr}
-            callback_batch = self._prepare_callback_batch(image, label, data)
 
             # Add warm-up information to log
             if self.scheduler is not None and hasattr(self.scheduler, 'warmup_steps'):
@@ -651,22 +678,12 @@ class Trainer(object):
                 completed_steps = self.step + 1
                 step_milestone = completed_steps // self.save_and_sample_every
 
-                val_metrics = None
-                checkpoint_callback = callback_batch
-                checkpoint_image = image
-                checkpoint_mask = categorical_mask
-                checkpoint_label = label
-
-                if self.val_dl is not None and (not self.is_distributed or self.rank == 0):
+                if (self.val_dl is not None or self.source_val_loaders is not None) and (
+                    not self.is_distributed or self.rank == 0
+                ):
                     val_metrics = self._evaluate_validation()
                     self._handle_validation_results(val_metrics, completed_steps)
                     if val_metrics is not None:
-                        cb = val_metrics.get('callback_batch')
-                        if cb is not None:
-                            checkpoint_callback = cb
-                        ckpt_batch = val_metrics.get('ckpt_batch')
-                        if ckpt_batch is not None:
-                            checkpoint_image, checkpoint_mask, checkpoint_label = ckpt_batch
                         log['val_loss'] = val_metrics.get('loss')
                         log['val_dice'] = val_metrics.get('dice')
                         log['val_hd95'] = val_metrics.get('hd95')
@@ -675,14 +692,7 @@ class Trainer(object):
                             log['best_checkpoint_step'] = self.best_val_step
                             log['best_checkpoint_path'] = self.best_checkpoint_path
 
-                self._run_checkpoint(
-                    milestone=step_milestone,
-                    callback_batch=checkpoint_callback,
-                    image=checkpoint_image,
-                    mask=checkpoint_mask,
-                    label=checkpoint_label,
-                    reason='step'
-                )
+                self._run_checkpoint(milestone=step_milestone)
 
                 if self.best_val_step is not None:
                     log.setdefault('best_dice', self.best_val_dice)
@@ -692,6 +702,14 @@ class Trainer(object):
             log_fn(log)
             self._log_train_metrics(log['loss'], log['lr'])
             self.step += 1
+            if self.should_stop_early:
+                if not self.is_distributed or self.rank == 0:
+                    print(
+                        f"Early stopping triggered at step {self.step} "
+                        f"(patience={self.early_stopping_patience}, best_step={self.best_val_step}, "
+                        f"best_dice={self.best_val_dice:.4f})"
+                    )
+                break
 
         self.save('final')
         print(f'training completed: {self.results_folder / "model-final.pt"}')

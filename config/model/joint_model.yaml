@@ -24,19 +24,23 @@ cfg_condition_mask_ratio: 0.2
 
 train_lr: 1e-4
 train_num_steps: 100000
+lr_schedule_total_steps: 100000
 save_and_sample_every: 1000
-gradient_accumulate_every: 2
+gradient_accumulate_every: 1
 max_grad_norm: 1.0
 ema_decay: 0.995
 amp: false
 gpus: 0
+seed: 0
 
 timesteps: 50
 sampler: categorical
 sampling_steps: 5
 
-vis_num_slices: 3
-vis_max_samples: 2
-vis_overlay_alpha: 0.45
-vis_slices: null
-max_val_batches: 1
+source_val_four_conditions: true
+early_stopping_enabled: true
+early_stopping_patience: 10
+early_stopping_min_delta: 0.001
+early_stopping_min_updates: 25000
+
+max_val_batches: null

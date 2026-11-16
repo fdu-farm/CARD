@@ -882,9 +882,6 @@ class CategoricalDiffusion(nn.Module):
         )
 
     @torch.inference_mode()
-    def test(self, y, x, label, milestone):
-        return
-
     @torch.inference_mode()
     def categorical_sample_loop(
         self,
@@ -997,11 +994,8 @@ class CategoricalDiffusion(nn.Module):
             js_map = js_divergence_map(primary_probs, reference_probs)
             js_history.append(js_map)
 
-            weight = torch.sigmoid((js_map - w_b) / w_k)
-            step_temperature = t_min + weight * (t_max - t_min)
-            pred_x0 = F.softmax(final_logits.float() / step_temperature, dim=1).to(final_logits.dtype)
             if index + 1 < len(step_list):
-                probs = self._categorical_step(pred_x0, int(step_list[index + 1]))
+                probs = self._categorical_step(primary_probs, int(step_list[index + 1]))
 
         if final_logits is None:
             raise RuntimeError("CARD sampler produced no reverse steps")
@@ -1009,14 +1003,13 @@ class CategoricalDiffusion(nn.Module):
         weight = torch.sigmoid((tac - w_b) / w_k)
         temperature = t_min + weight * (t_max - t_min)
         probabilities = F.softmax(final_logits.float() / temperature, dim=1).to(final_logits.dtype)
-        distribution = OneHotCategoricalBCHW(probs=probabilities)
         mode = self._validate_final_step_mode(final_step_mode)
         if mode == "sample":
-            categorical = distribution.sample()
+            prediction = OneHotCategoricalBCHW(probs=probabilities).sample().argmax(dim=1, keepdim=True)
         else:
-            categorical = distribution.max_prob_sample()
+            prediction = final_logits.argmax(dim=1, keepdim=True)
         return {
-            "prediction": categorical.argmax(dim=1, keepdim=True),
+            "prediction": prediction,
             "probabilities": probabilities,
             "final_logits": final_logits.detach(),
             "tac": tac.detach(),

@@ -48,9 +48,8 @@ def dilated_foreground_roi_external2d(
     """Return the exact per-slice 2D kernel ROI used by CARD metrics.
 
     ``labels`` may be ``(B,H,W)`` or ``(B,1,H,W)``.  For even kernels such as
-    10, padding is asymmetric (4 pixels before and 5 after), matching the
-    reported evaluation path.  Volumes should be flattened into independent
-    2D slices before calling this helper.
+    10, padding is asymmetric (4 pixels before and 5 after).  Volumes should
+    be flattened into independent 2D slices before calling this helper.
     """
     _require_torch()
     label_spatial = _as_label_tensor(labels)
@@ -84,7 +83,7 @@ def roi_arrays_from_tensors_slice2d_kernel10_external(
     ignore_index: int = -1,
     max_pixels: Optional[int] = None,
     seed: int = 0,
-    dtype: np.dtype = np.float16,
+    dtype: np.dtype = np.float32,
 ) -> tuple[np.ndarray, np.ndarray]:
     """Extract ``(probs_roi, labels_roi)`` with per-slice 2D kernel dilation.
 
@@ -158,7 +157,7 @@ def calibration_from_roi_arrays(
     num_bins: int = 10,
     eps: float = 1e-8,
 ) -> dict[str, float | int]:
-    """Compute ROI-ECE/SCE/ACE/NLL from saved ROI arrays."""
+    """Compute ROI-ECE/SCE/ACE/NLL; an empty valid ROI is undefined (NaN)."""
     probs = np.asarray(probs_roi, dtype=np.float64)
     labels = np.asarray(labels_roi, dtype=np.int64).reshape(-1)
     if probs.ndim != 2:
@@ -168,7 +167,7 @@ def calibration_from_roi_arrays(
     labels = labels[valid]
     n = int(labels.shape[0])
     if n == 0:
-        return {"roi_ece": 0.0, "roi_sce": 0.0, "roi_ace": 0.0, "roi_nll": 0.0, "n_roi_pixels": 0}
+        return {"roi_ece": float("nan"), "roi_sce": float("nan"), "roi_ace": float("nan"), "roi_nll": float("nan"), "n_roi_pixels": 0}
 
     pred = probs.argmax(axis=1)
     conf = probs[np.arange(n), pred]

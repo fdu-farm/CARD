@@ -7,6 +7,7 @@ import argparse
 import csv
 import json
 import os
+import pickle
 import random
 import sys
 from pathlib import Path
@@ -25,6 +26,7 @@ from dataset.acdc_nnunet_dataloader import data_collate
 from dataset.mnm_nnunet_dataloader import MNM_nnUNet_Dataset
 from model.ddpm import CategoricalDiffusion
 from train import create_denoising_model
+from inference.predictor_config import resolve_cardiac_predictor, sample_cardiac
 from utils.canonical_roi_metrics import (
     calibration_from_roi_arrays,
     roi_arrays_from_tensors_slice2d_kernel10_external,
@@ -82,8 +84,11 @@ def _model_cfg(num_classes: int, model_type: str):
 
 
 def load_model_state(checkpoint: Path) -> dict[str, torch.Tensor]:
-    payload = torch.load(checkpoint, map_location="cpu", weights_only=True)
-    state = payload["ema"] if "ema" in payload else payload
+    try:
+        payload = torch.load(checkpoint, map_location="cpu", weights_only=True)
+    except pickle.UnpicklingError:
+        payload = torch.load(checkpoint, map_location="cpu", weights_only=False)
+    state = payload["ema"] if isinstance(payload, dict) and "ema" in payload else payload
     if not isinstance(state, dict):
         raise ValueError(f"Invalid CARD model weights: {checkpoint}")
     state = {key.removeprefix("module."): value for key, value in state.items()}
@@ -94,15 +99,17 @@ def load_model_state(checkpoint: Path) -> dict[str, torch.Tensor]:
 
 def build_diffusion(num_classes: int, model_type: str, checkpoint: Path, device: torch.device):
     state = load_model_state(checkpoint)
+    predictor = resolve_cardiac_predictor()
     image_size = int(state["null_emb_xt"].shape[-1])
     dataset_cfg = OmegaConf.create({"diffusion_depth_size": 1})
     denoiser = create_denoising_model(_model_cfg(num_classes, model_type), dataset_cfg)
     diffusion = CategoricalDiffusion(
         denoiser, image_size=image_size, num_frames=1, num_classes=num_classes,
-        cond_channels=1, timesteps=50, objective="categorical",
+        cond_channels=1, timesteps=predictor["timesteps"], objective="categorical",
         aux_loss_type="dice_ce", aux_loss_weight=1.0, aux_dice_weight=0.5,
-        aux_ce_weight=0.5, kl_loss_weight=0.1, final_step_mode="majority",
-        condition_mask_ratio=0.2, sample_mode="one_hot", inference_stochastic=False,
+        aux_ce_weight=0.5, kl_loss_weight=0.1, final_step_mode=predictor["final_step_mode"],
+        condition_mask_ratio=0.2, sample_mode=predictor["sample_mode"],
+        inference_stochastic=predictor["inference_stochastic"],
     )
     diffusion.load_state_dict(state, strict=True)
     diffusion.to(device).eval()
@@ -125,19 +132,19 @@ def _dice(pred: np.ndarray, label: np.ndarray, num_classes: int) -> float:
     return float(np.mean(values)) if values else 1.0
 
 
-def _finish_case(case_id: str, slices: list[tuple[int, np.ndarray, np.ndarray]], meta: dict, output_dir: Path):
+def _finish_case(case_id: str, slices: list[tuple[int, np.ndarray, np.ndarray, np.ndarray]], meta: dict, output_dir: Path):
     ordered = sorted(slices, key=lambda item: item[0])
     probs = np.stack([item[1] for item in ordered], axis=1)  # C,D,H,W
-    labels = np.stack([item[2] for item in ordered], axis=0)  # D,H,W
+    preds = np.stack([item[2] for item in ordered], axis=0)  # D,H,W
+    labels = np.stack([item[3] for item in ordered], axis=0)  # D,H,W
     prob_tensor = torch.from_numpy(probs).unsqueeze(0)
     label_tensor = torch.from_numpy(labels).unsqueeze(0)
     if meta["roi_sample_mode"] != "slice2d_kernel10_external":
         raise RuntimeError(f"Unsupported ROI sample mode: {meta['roi_sample_mode']}")
     probs_roi, labels_roi = roi_arrays_from_tensors_slice2d_kernel10_external(
-        prob_tensor, label_tensor, roi_dilation_kernel=10, dtype=np.float16,
+        prob_tensor, label_tensor, roi_dilation_kernel=10, dtype=np.float32,
     )
     metrics = calibration_from_roi_arrays(probs_roi, labels_roi, num_bins=10)
-    pred = probs.argmax(axis=0)
     public_case_id = f"{meta['scanner']}__{case_id}" if meta.get("scanner") else case_id
     safe_group = str(meta["reporting_group"]).replace("/", "_").replace("\\", "_").replace(" ", "_")
     sample_dir = output_dir / "roi_samples"
@@ -145,7 +152,7 @@ def _finish_case(case_id: str, slices: list[tuple[int, np.ndarray, np.ndarray]],
     sample_path = sample_dir / f"{safe_group}__{public_case_id}__roi_kernel10.npz"
     np.savez_compressed(sample_path, probs_roi=probs_roi, labels_roi=labels_roi)
     return {
-        **meta, "case_id": public_case_id, "dice": _dice(pred, labels, probs.shape[0]),
+        **meta, "case_id": public_case_id, "dice": _dice(preds, labels, probs.shape[0]),
         **metrics, "roi_sample_path": str(sample_path),
     }
 
@@ -153,6 +160,11 @@ def _finish_case(case_id: str, slices: list[tuple[int, np.ndarray, np.ndarray]],
 def infer_dataset(diffusion, reference_diffusion, dataset, meta: dict, tuple_params: dict, args):
     loader = DataLoader(dataset, batch_size=args.batch_size, shuffle=False, num_workers=args.num_workers, collate_fn=data_collate)
     rows, current_case, current_slices = [], None, []
+    predictor = resolve_cardiac_predictor(
+        args.primary_model_type, args.reference_model_type,
+        primary_cond_scale=args.primary_cond_scale,
+        reference_cond_scale=args.reference_cond_scale,
+    )
     device = next(diffusion.parameters()).device
     with torch.inference_mode():
         for batch in loader:
@@ -162,16 +174,11 @@ def infer_dataset(diffusion, reference_diffusion, dataset, meta: dict, tuple_par
                 images = images.squeeze(2)
             if labels.ndim == 5:
                 labels = labels.squeeze(2)
-            output = diffusion.sample_full_tac(
-                channel_cond=images,
-                reference_denoise_fn=reference_diffusion.denoise_fn,
-                primary_cond_scale=args.primary_cond_scale,
-                reference_cond_scale=args.reference_cond_scale,
-                t_min=tuple_params["t_min"],
-                t_max=tuple_params["t_max"],
-                w_b=tuple_params["w_b"], w_k=tuple_params["w_k"],
+            output = sample_cardiac(
+                diffusion, reference_diffusion, images, tuple_params, predictor=predictor,
             )
             probs = output["probabilities"]
+            preds_np = output["prediction"].squeeze(1).cpu().numpy()
             probs_np = probs.float().cpu().numpy()
             labels_np = labels.cpu().numpy()
             names = batch["name"]
@@ -180,14 +187,10 @@ def infer_dataset(diffusion, reference_diffusion, dataset, meta: dict, tuple_par
                 if current_case is not None and case_id != current_case:
                     rows.append(_finish_case(current_case, current_slices, meta, args.output_dir))
                     current_slices = []
-                    if args.max_cases and len(rows) >= args.max_cases:
-                        break
                 current_case = case_id
                 label_slice = np.squeeze(labels_np[index]).astype(np.int64)
-                current_slices.append((z_index, probs_np[index], label_slice))
-            if args.max_cases and len(rows) >= args.max_cases:
-                break
-    if current_slices and (not args.max_cases or len(rows) < args.max_cases):
+                current_slices.append((z_index, probs_np[index], preds_np[index], label_slice))
+    if current_slices:
         rows.append(_finish_case(current_case, current_slices, meta, args.output_dir))
     return rows
 
@@ -203,7 +206,7 @@ def make_jobs(args):
             yield ACDC_C_TorchIO_Dataset(root_dir=str(root), mode="test", corruption_type=condition, severity=1, seed=42, **common), {"display_block": "ACDC-C", "reporting_group": condition, "roi_sample_mode": "slice2d_kernel10_external"}
     elif args.block == "mnm":
         for vendor in "ABCD":
-            yield MNM_nnUNet_Dataset(str(args.mnm_root), vendor, args.max_cases), {"display_block": "M&Ms", "reporting_group": vendor, "roi_sample_mode": "slice2d_kernel10_external"}
+            yield MNM_nnUNet_Dataset(str(args.mnm_root), vendor), {"display_block": "M&Ms", "reporting_group": vendor, "roi_sample_mode": "slice2d_kernel10_external"}
 
 
 def main() -> None:
@@ -214,7 +217,8 @@ def main() -> None:
     parser.add_argument("--output-dir", required=True, type=Path)
     parser.add_argument("--batch-size", type=int, default=4)
     parser.add_argument("--num-workers", type=int, default=2)
-    parser.add_argument("--max-cases", type=int)
+    parser.add_argument("--primary-cond-scale", type=float, default=None)
+    parser.add_argument("--reference-cond-scale", type=float, default=None)
     parser.add_argument("--device", default="cuda")
     parser.add_argument("--primary-checkpoint", required=True, type=Path)
     parser.add_argument("--reference-checkpoint", required=True, type=Path)
@@ -257,8 +261,13 @@ def main() -> None:
             f"{primary_model.image_size} != {reference_model.image_size}"
         )
     args.image_size = int(primary_model.image_size)
-    args.primary_cond_scale = 0.8
-    args.reference_cond_scale = 0.8
+    predictor = resolve_cardiac_predictor(
+        args.primary_model_type, args.reference_model_type,
+        primary_cond_scale=args.primary_cond_scale,
+        reference_cond_scale=args.reference_cond_scale,
+    )
+    args.primary_cond_scale = predictor["primary_scale"]
+    args.reference_cond_scale = predictor["reference_scale"]
     args.output_dir.mkdir(parents=True, exist_ok=True)
     rows = []
     for dataset, meta in make_jobs(args):

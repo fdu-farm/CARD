@@ -1,15 +1,5 @@
 #!/usr/bin/env python3
-"""Select CARD four-parameter tuples from source-validation caches.
-
-This script runs the CARD parameter-selection stage.  It does **not**
-run model inference.  It consumes source-validation cache files produced by the
-training/evaluation pipeline:
-
-```
-source_val_cache/<setting>/*.npz
-  required arrays: final_logits, agg_js, gt_label
-```
-"""
+"""Select CARD four-parameter tuples from source-validation caches."""
 
 from __future__ import annotations
 
@@ -25,13 +15,8 @@ from typing import Any, Iterable, Sequence
 
 import numpy as np
 import pandas as pd
-
-try:
-    import torch
-    import torch.nn.functional as F
-except ModuleNotFoundError as exc:  # pragma: no cover
-    raise SystemExit("select_card_parameters.py requires torch") from exc
-
+import torch
+import torch.nn.functional as F
 from scipy.optimize import minimize
 
 PROJECT_ROOT = Path(__file__).resolve().parents[1]
@@ -42,7 +27,7 @@ from utils.canonical_roi_metrics import dilated_foreground_roi_external2d  # noq
 from evaluation.selection_protocol import (  # noqa: E402
     build_selection_result,
     load_protocol_manifest,
-    validate_formal_cache,
+    validate_cache,
 )
 
 
@@ -76,9 +61,9 @@ class Params:
 class CacheCase:
     setting: str
     case_id: str
-    logits_roi: torch.Tensor  # (N,C)
-    js_roi: torch.Tensor      # (N,)
-    labels_roi: torch.Tensor  # (N,)
+    logits_roi: torch.Tensor
+    js_roi: torch.Tensor
+    labels_roi: torch.Tensor
     n_roi: int
     path: str
     meta: dict[str, Any]
@@ -140,20 +125,6 @@ def load_meta(raw: np.lib.npyio.NpzFile) -> dict[str, Any]:
         return {"raw_meta": text}
 
 
-def deterministic_subsample(n: int, max_samples: int | None, seed: int) -> np.ndarray | slice:
-    if max_samples is None or max_samples <= 0 or n <= max_samples:
-        return slice(None)
-    rng = np.random.default_rng(int(seed))
-    return rng.choice(n, size=int(max_samples), replace=False)
-
-
-def normalize_selection_roi_mode(mode: str) -> str:
-    normalized = str(mode).strip().lower().replace("-", "_")
-    if normalized in {"kernel10", "dilate10", "slice2d_kernel10", "slice2d_kernel10_external"}:
-        return "kernel10"
-    raise ValueError(f"Unsupported ROI mode {mode!r}; use kernel10.")
-
-
 def roi_samples_slice2d_kernel10(
     logits: torch.Tensor,
     agg_js: torch.Tensor,
@@ -192,23 +163,16 @@ def load_cache_cases(
     cache_root: Path,
     settings: Sequence[str],
     *,
-    roi_mode: str,
     device: torch.device,
     roi_dilation_kernel: int,
-    max_cases_per_setting: int | None,
-    roi_samples_per_case: int | None,
-    seed: int,
-    require_case_id_meta: bool,
 ) -> dict[str, list[CacheCase]]:
     out: dict[str, list[CacheCase]] = {}
-    for setting_idx, setting in enumerate(settings):
+    for setting in settings:
         files = sorted((cache_root / setting).glob("*.npz"))
-        if max_cases_per_setting and max_cases_per_setting > 0:
-            files = files[: int(max_cases_per_setting)]
         if not files:
             raise FileNotFoundError(f"No cache files found in {cache_root / setting}")
         cases = []
-        for idx, path in enumerate(files):
+        for path in files:
             raw = np.load(path, allow_pickle=False)
             required = {"final_logits", "agg_js", "gt_label"}
             missing = required.difference(raw.files)
@@ -219,39 +183,23 @@ def load_cache_cases(
             gt = torch.from_numpy(raw["gt_label"].astype(np.int64)).to(device)
             if agg_js.ndim == 4 and agg_js.shape[1] == 1:
                 agg_js = agg_js.squeeze(1)
-            normalized_roi_mode = normalize_selection_roi_mode(roi_mode)
-            if normalized_roi_mode == "kernel10":
-                logits_roi, js_roi, labels_roi = roi_samples_slice2d_kernel10(
-                    logits,
-                    agg_js,
-                    gt,
-                    roi_dilation_kernel=roi_dilation_kernel,
-                )
-            else:
-                raise ValueError(f"Unsupported roi_mode {roi_mode!r}")
-            valid_labels = (labels_roi >= 0) & (labels_roi < logits_roi.shape[1])
-            logits_roi = logits_roi[valid_labels]
-            js_roi = js_roi[valid_labels]
-            labels_roi = labels_roi[valid_labels]
-            take = deterministic_subsample(
-                int(labels_roi.numel()),
-                roi_samples_per_case,
-                seed=seed + 1009 * setting_idx + 9176 * idx,
+            logits_roi, js_roi, labels_roi = roi_samples_slice2d_kernel10(
+                logits,
+                agg_js,
+                gt,
+                roi_dilation_kernel=roi_dilation_kernel,
             )
-            if isinstance(take, np.ndarray):
-                take = torch.as_tensor(take, device=logits_roi.device, dtype=torch.long)
-            logits_roi = logits_roi[take].contiguous()
-            js_roi = js_roi[take].contiguous()
-            labels_roi = labels_roi[take].contiguous()
+            valid_labels = (labels_roi >= 0) & (labels_roi < logits_roi.shape[1])
+            logits_roi = logits_roi[valid_labels].contiguous()
+            js_roi = js_roi[valid_labels].contiguous()
+            labels_roi = labels_roi[valid_labels].contiguous()
             meta = load_meta(raw)
-            if require_case_id_meta and not meta.get("case_id"):
-                raise ValueError(
-                    f"Formal selection requires meta.case_id in every cache file; missing in {path}"
-                )
+            if not meta.get("case_id"):
+                raise ValueError(f"Missing meta.case_id in cache file {path}")
             cases.append(
                 CacheCase(
                     setting=setting,
-                    case_id=str(meta.get("case_id", path.stem)),
+                    case_id=str(meta["case_id"]),
                     logits_roi=logits_roi,
                     js_roi=js_roi,
                     labels_roi=labels_roi,
@@ -342,46 +290,12 @@ def calibration_metrics_for_cases(cases: Sequence[CacheCase], params: Params, nu
     }
 
 
-def roi_ece_for_cases(cases: Sequence[CacheCase], params: Params, num_bins: int) -> float:
-    """Compute ROI-ECE with the same bin convention as the reported metric."""
-
-    counts = torch.zeros(int(num_bins), dtype=torch.float64, device=cases[0].logits_roi.device)
-    confidence_sums = torch.zeros_like(counts)
-    correct_sums = torch.zeros_like(counts)
-    boundaries = torch.linspace(0.0, 1.0, int(num_bins) + 1, device=counts.device)[1:-1]
-    for case in cases:
-        if case.labels_roi.numel() == 0:
-            continue
-        probs = apply_tac_logits(case.logits_roi, case.js_roi, params)
-        confidence, prediction = probs.max(dim=1)
-        bin_ids = torch.bucketize(confidence, boundaries, right=False)
-        counts.scatter_add_(0, bin_ids, torch.ones_like(confidence, dtype=torch.float64))
-        confidence_sums.scatter_add_(0, bin_ids, confidence.to(torch.float64))
-        correct_sums.scatter_add_(0, bin_ids, prediction.eq(case.labels_roi).to(torch.float64))
-    total = counts.sum()
-    if total.item() == 0:
-        raise RuntimeError("No valid ROI samples")
-    nonempty = counts > 0
-    accuracy = correct_sums[nonempty] / counts[nonempty]
-    mean_confidence = confidence_sums[nonempty] / counts[nonempty]
-    return float(((counts[nonempty] / total) * (accuracy - mean_confidence).abs()).sum().item())
-
-
 def objective_for_settings(
     setting_cases: dict[str, list[CacheCase]],
     settings: Sequence[str],
     params: Params,
-    *,
-    objective: str = "roi_nll",
-    num_bins: int = 15,
 ) -> float:
-    if objective == "roi_nll":
-        values = [nll_for_cases(setting_cases[name], params)[0] for name in settings]
-    elif objective == "roi_ece":
-        values = [roi_ece_for_cases(setting_cases[name], params, num_bins) for name in settings]
-    else:
-        raise ValueError(f"Unsupported objective: {objective!r}")
-    return float(np.mean(values))
+    return float(np.mean([nll_for_cases(setting_cases[name], params)[0] for name in settings]))
 
 
 def iter_grid(
@@ -417,19 +331,11 @@ def optimize(
     ftol: float,
     no_refine: bool,
     num_bins: int,
-    objective: str,
 ) -> tuple[pd.DataFrame, pd.DataFrame, dict[str, Any]]:
-    objective_column = {"roi_nll": "objective_nll", "roi_ece": "objective_ece"}[objective]
+    objective_column = "objective_nll"
     rows = []
     started = time.time()
     for idx, params in enumerate(iter_grid(t_min_grid, t_max_grid, w_b_grid, w_k_grid)):
-        objective_value = objective_for_settings(
-            setting_cases,
-            settings,
-            params,
-            objective=objective,
-            num_bins=num_bins,
-        )
         rows.append({
             "stage": "grid",
             "init_rank": idx,
@@ -437,7 +343,7 @@ def optimize(
             "t_max": params.t_max,
             "w_b": params.w_b,
             "w_k": params.w_k,
-            objective_column: objective_value,
+            objective_column: objective_for_settings(setting_cases, settings, params),
             "boundary_hit": boundary_hit(params, bounds),
         })
         if (idx + 1) % 100 == 0:
@@ -450,13 +356,7 @@ def optimize(
                 params = validate_params(values)
             except ValueError:
                 return 1e9
-            val = objective_for_settings(
-                setting_cases,
-                settings,
-                params,
-                objective=objective,
-                num_bins=num_bins,
-            )
+            val = objective_for_settings(setting_cases, settings, params)
             return val if math.isfinite(val) else 1e9
 
         for rank, row in grid.head(int(top_k)).iterrows():
@@ -467,6 +367,7 @@ def optimize(
                 x0=np.array(init.as_tuple(), dtype=np.float64),
                 method="SLSQP",
                 bounds=bounds,
+                constraints=({"type": "ineq", "fun": lambda x: float(x[1] - x[0] - 1e-3)},),
                 options={"maxiter": int(maxiter), "ftol": float(ftol)},
             )
             params = validate_params(result.x if result.success else init.as_tuple())
@@ -477,13 +378,7 @@ def optimize(
                 "t_max": params.t_max,
                 "w_b": params.w_b,
                 "w_k": params.w_k,
-                objective_column: objective_for_settings(
-                    setting_cases,
-                    settings,
-                    params,
-                    objective=objective,
-                    num_bins=num_bins,
-                ),
+                objective_column: objective_for_settings(setting_cases, settings, params),
                 "boundary_hit": boundary_hit(params, bounds),
                 "success": bool(result.success),
                 "status": int(result.status),
@@ -503,20 +398,14 @@ def optimize(
     selected = {
         "selected": {
             "stage": str(best_row["stage"]),
-            "objective": objective,
+            "objective": "roi_nll",
             "params": {
                 "t_min": best_params.t_min,
                 "t_max": best_params.t_max,
                 "w_b": best_params.w_b,
                 "w_k": best_params.w_k,
             },
-            objective_column: objective_for_settings(
-                setting_cases,
-                settings,
-                best_params,
-                objective=objective,
-                num_bins=num_bins,
-            ),
+            objective_column: objective_for_settings(setting_cases, settings, best_params),
             "boundary_hit": boundary_hit(best_params, bounds),
         },
         "per_setting": per_setting,
@@ -531,34 +420,14 @@ def main() -> None:
     parser.add_argument("--out-dir", required=True, type=Path)
     parser.add_argument("--dataset", choices=sorted(DATASET_SETTINGS), required=True)
     parser.add_argument(
-        "--run-kind",
-        choices=["formal", "scout"],
-        default="formal",
-        help="Formal runs require the complete source-validation cache; scout runs may use a subset.",
-    )
-    parser.add_argument(
         "--protocol-manifest",
         type=Path,
-        default=None,
-        help="Locked source-validation manifest. Required for formal selection.",
+        default=PROJECT_ROOT / "metadata" / "card_source_val_manifest.json",
     )
-    parser.add_argument("--settings", default=None, help="Comma-separated cache setting names. Default is the locked CARD setting list.")
-    parser.add_argument(
-        "--selection-roi-mode",
-        default="kernel10",
-        help="Source-validation ROI mode. Default/kernel10 uses exact per-slice 2D kernel-10 GT dilation.",
-    )
+    parser.add_argument("--settings", default=None)
     parser.add_argument("--device", choices=["auto", "cpu", "cuda"], default="auto")
     parser.add_argument("--roi-dilation-kernel", type=int, default=10)
-    parser.add_argument("--max-cases-per-setting", type=int, default=None)
-    parser.add_argument("--roi-samples-per-case", type=int, default=None)
     parser.add_argument("--num-bins", type=int, default=15)
-    parser.add_argument(
-        "--objective",
-        choices=["roi_nll", "roi_ece"],
-        default="roi_nll",
-        help="Source-validation objective. Formal selection uses ROI-NLL.",
-    )
     parser.add_argument("--top-k", type=int, default=5)
     parser.add_argument("--maxiter", type=int, default=200)
     parser.add_argument("--ftol", type=float, default=1e-9)
@@ -568,27 +437,14 @@ def main() -> None:
     parser.add_argument("--w-b-grid", default=None)
     parser.add_argument("--w-k-grid", default=None)
     parser.add_argument("--bounds", default="1.0,10.0;5.0,30.0;0.001,0.080;0.001,0.020")
-    parser.add_argument("--seed", type=int, default=20260522)
     args = parser.parse_args()
-
-    if args.run_kind == "formal":
-        if args.protocol_manifest is None:
-            raise ValueError("--protocol-manifest is required for formal selection")
-        if args.max_cases_per_setting not in (None, 0):
-            raise ValueError("Formal selection forbids --max-cases-per-setting")
-        if args.roi_samples_per_case not in (None, 0):
-            raise ValueError("Formal selection forbids ROI-pixel subsampling; omit --roi-samples-per-case")
-        if args.objective != "roi_nll":
-            raise ValueError("Formal selection uses --objective roi_nll; use --run-kind scout for ROI-ECE analysis")
 
     if args.settings:
         settings = [x.strip() for x in args.settings.split(",") if x.strip()]
     else:
         settings = default_settings(args.dataset)
 
-    dataset_protocol: dict[str, Any] | None = None
-    if args.protocol_manifest is not None:
-        _, dataset_protocol = load_protocol_manifest(args.protocol_manifest, args.dataset)
+    _, dataset_protocol = load_protocol_manifest(args.protocol_manifest, args.dataset)
 
     if args.device == "auto":
         device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
@@ -596,30 +452,13 @@ def main() -> None:
         device = torch.device(args.device)
 
     args.out_dir.mkdir(parents=True, exist_ok=True)
-    selection_roi_mode = normalize_selection_roi_mode(args.selection_roi_mode)
     setting_cases = load_cache_cases(
         args.cache_root,
         settings,
-        roi_mode=selection_roi_mode,
         device=device,
         roi_dilation_kernel=args.roi_dilation_kernel,
-        max_cases_per_setting=args.max_cases_per_setting,
-        roi_samples_per_case=args.roi_samples_per_case,
-        seed=args.seed,
-        require_case_id_meta=args.run_kind == "formal",
     )
-
-    cache_audit: dict[str, Any]
-    if args.run_kind == "formal":
-        assert dataset_protocol is not None
-        cache_audit = validate_formal_cache(setting_cases, settings, dataset_protocol)
-    else:
-        cache_audit = {
-            "complete": False,
-            "observed_case_ids_by_setting": {
-                setting: [case.case_id for case in setting_cases[setting]] for setting in settings
-            },
-        }
+    cache_audit = validate_cache(setting_cases, settings, dataset_protocol)
 
     grid, refined, selected = optimize(
         setting_cases,
@@ -634,7 +473,6 @@ def main() -> None:
         ftol=args.ftol,
         no_refine=args.no_refine,
         num_bins=args.num_bins,
-        objective=args.objective,
     )
     grid.to_csv(args.out_dir / "coarse_grid_results.csv", index=False)
     if not refined.empty:
@@ -643,29 +481,23 @@ def main() -> None:
         writer = csv.DictWriter(f, fieldnames=["setting", "roi_nll", "roi_ece", "roi_sce", "roi_ace", "n_roi_pixels"])
         writer.writeheader()
         writer.writerows(selected["per_setting"])
-    protocol_manifest = None
-    if args.protocol_manifest is not None:
-        resolved_manifest = args.protocol_manifest.resolve()
-        try:
-            protocol_manifest = resolved_manifest.relative_to(PROJECT_ROOT).as_posix()
-        except ValueError:
-            protocol_manifest = str(resolved_manifest)
+    resolved_manifest = args.protocol_manifest.resolve()
+    try:
+        protocol_manifest = resolved_manifest.relative_to(PROJECT_ROOT).as_posix()
+    except ValueError:
+        protocol_manifest = str(resolved_manifest)
     manifest = build_selection_result(
         dataset=args.dataset,
         selected=selected,
         family=DEFAULT_FAMILY,
         settings=settings,
         roi_dilation_kernel=args.roi_dilation_kernel,
-        run_kind=args.run_kind,
         protocol_manifest=protocol_manifest,
-        dataset_protocol=dataset_protocol,
         cache_audit=cache_audit,
         cache_root=args.cache_root,
-        roi_samples_per_case=args.roi_samples_per_case,
         num_bins=args.num_bins,
-        objective=args.objective,
     )
-    (args.out_dir / "selected_tuple.json").write_text(json.dumps(manifest, indent=2), encoding="utf-8")
+    (args.out_dir / "selected_tuple.json").write_text(json.dumps(manifest, indent=2) + "\n", encoding="utf-8")
     print(json.dumps(manifest["selected"]["params"], indent=2), flush=True)
     print(f"[done] {args.out_dir}", flush=True)
 

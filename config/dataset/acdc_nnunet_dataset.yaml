@@ -18,8 +18,8 @@ categorical_use_background: true
 img_size: [1, 256, 256]
 
 # Batch size for 2D slices
-batch_size: 32
-num_workers: 8
+batch_size: 8
+num_workers: 4
 
 # Split configuration
 split_config:

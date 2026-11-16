@@ -1,7 +1,7 @@
 # CARD: Calibration via Agreement in Reverse Diffusion for Out-of-Domain MRI Segmentation
 
 This repository provides the official implementation of CARD on ACDC-C and
-M&Ms. CARD parameters are fitted exclusively on ACDC source-validation data
+M&Ms. CARD parameters are fitted on ACDC source-validation data
 before evaluation. Pretrained checkpoints are provided for inference, and
 training code is also included.
 
@@ -119,8 +119,8 @@ reported in percent.
 
 | Dataset | Dice ↑ | ROI-ECE ↓ | ROI-SCE ↓ | ROI-ACE ↓ | ROI-NLL ↓ |
 |---|---:|---:|---:|---:|---:|
-| ACDC-C | 0.8536 | 6.35 | 3.87 | 3.65 | 0.405 |
-| M&Ms | 0.7865 | 5.94 | 3.78 | 3.50 | 0.437 |
+| ACDC-C | 0.8549 | 5.59 | 3.84 | 3.65 | 0.392 |
+| M&Ms | 0.7675 | 5.14 | 3.79 | 3.62 | 0.433 |
 
 ## Optional model training
 
@@ -131,8 +131,10 @@ checkpoints:
 bash scripts/02_train.sh "$WORK/nnUNet_preprocessed" "$OUTPUT" both
 ```
 
-The primary model trains for 100,000 steps. The smaller reference model trains
-for 25,000 steps. Checkpoints are saved every 1,000 steps.
+The primary model trains under a 100,000-step cosine schedule with four-condition
+source-validation early stopping (`model-best.pt`). The smaller reference model
+trains for 25,000 steps under the same 100,000-step cosine schedule (`model-final.pt`).
+Checkpoints are saved every 1,000 steps, and `SEED` sets the training random seed.
 
 ## Repository structure
 

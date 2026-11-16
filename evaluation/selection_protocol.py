@@ -1,4 +1,4 @@
-"""Lightweight source-validation protocol checks for CARD tuple selection."""
+"""Source-validation protocol checks for CARD parameter selection."""
 
 from __future__ import annotations
 
@@ -8,7 +8,7 @@ from pathlib import Path
 from typing import Any, Protocol, Sequence
 
 
-FORMAL_ROI_SAMPLE_MODE = "slice2d_kernel10_external"
+ROI_SAMPLE_MODE = "slice2d_kernel10_external"
 
 
 class CaseWithId(Protocol):
@@ -48,12 +48,12 @@ def validate_case_inventory(
     unexpected = sorted(observed_set - expected_set)
     if missing or unexpected:
         raise ValueError(
-            f"Incomplete or contaminated {context}: missing={missing}, unexpected={unexpected}"
+            f"Incomplete or unexpected cases in {context}: missing={missing}, unexpected={unexpected}"
         )
     return observed
 
 
-def validate_formal_cache(
+def validate_cache(
     setting_cases: dict[str, list[CaseWithId]],
     settings: Sequence[str],
     dataset_protocol: dict[str, Any],
@@ -61,7 +61,7 @@ def validate_formal_cache(
     expected_settings = [str(value) for value in dataset_protocol["settings"]]
     if list(settings) != expected_settings:
         raise ValueError(
-            "Formal selection settings do not match the locked protocol: "
+            "Selection settings do not match the protocol manifest: "
             f"got={list(settings)}, expected={expected_settings}"
         )
 
@@ -73,7 +73,7 @@ def validate_formal_cache(
         observed[setting] = validate_case_inventory(
             case_ids,
             expected_ids,
-            f"formal cache for {setting}",
+            f"cache for {setting}",
         )
     return {
         "expected_case_ids": expected_ids,
@@ -89,45 +89,26 @@ def build_selection_result(
     family: str,
     settings: Sequence[str],
     roi_dilation_kernel: int,
-    run_kind: str,
-    protocol_manifest: str | None,
-    dataset_protocol: dict[str, Any] | None,
+    protocol_manifest: str,
     cache_audit: dict[str, Any],
     cache_root: str | Path,
-    roi_samples_per_case: int | None,
     num_bins: int,
-    objective: str = "roi_nll",
 ) -> dict[str, Any]:
-    formal = run_kind == "formal"
-    if formal:
-        if protocol_manifest is None or dataset_protocol is None:
-            raise ValueError("Formal selection requires the locked source-validation manifest and dataset protocol")
-        provenance = {
-            "source_val_manifest": protocol_manifest,
-            "status": "locked",
-        }
-    else:
-        provenance = {"status": "scout_only"}
-
     return {
         "schema_version": 2,
-        "formal_run": formal,
         "dataset": dataset,
         **selected,
         "cache_audit": cache_audit,
         "protocol": {
             "family": family,
             "settings": list(settings),
-            "roi_sample_mode": FORMAL_ROI_SAMPLE_MODE,
+            "roi_sample_mode": ROI_SAMPLE_MODE,
             "roi_dilation_kernel": int(roi_dilation_kernel),
-            "objective": {
-                "roi_nll": "condition-equal mean source-validation ROI-NLL",
-                "roi_ece": "condition-equal mean source-validation ROI-ECE",
-            }[objective],
+            "objective": "condition-equal mean source-validation ROI-NLL",
             "cache_root": str(cache_root),
-            "run_kind": run_kind,
-            "roi_samples_per_case": roi_samples_per_case,
             "num_bins": int(num_bins),
         },
-        "provenance": provenance,
+        "provenance": {
+            "source_val_manifest": protocol_manifest,
+        },
     }

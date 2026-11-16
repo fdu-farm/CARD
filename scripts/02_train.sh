@@ -29,6 +29,7 @@ cd "${PACKAGE_ROOT}"
 train_primary() {
   "${PYTHON_BIN}" train.py \
     --config-name joint_cfg dataset=acdc_nnunet_dataset \
+    model.seed="${SEED:-0}" \
     model.diffusion_type=categorical dataset.categorical_use_background=true \
     model.categorical_aux_loss_type=dice_ce model.categorical_aux_loss_weight=1.0 \
     model.categorical_aux_dice_weight=0.5 model.categorical_aux_ce_weight=0.5 \
@@ -36,30 +37,47 @@ train_primary() {
     model.results_folder="${OUTPUT_ROOT}/checkpoints" \
     model.results_folder_postfix=acdc_base_swinunetr \
     model.train_num_steps="${PRIMARY_TRAIN_STEPS:-100000}" \
+    model.lr_schedule_total_steps="${PRIMARY_LR_STEPS:-100000}" \
     model.save_and_sample_every="${SAVE_EVERY:-1000}" model.timesteps=50 \
     model.train_lr="${TRAIN_LR:-1e-4}" dataset.batch_size="${PRIMARY_BATCH_SIZE:-8}" \
-    dataset.num_workers="${NUM_WORKERS:-4}" ++dataset.val_num_workers="${VAL_NUM_WORKERS:-2}" \
-    model.gradient_accumulate_every="${PRIMARY_GRAD_ACCUM:-2}" \
+    dataset.num_workers="${NUM_WORKERS:-4}" ++dataset.val_num_workers="${VAL_NUM_WORKERS:-0}" \
+    model.gradient_accumulate_every="${PRIMARY_GRAD_ACCUM:-1}" \
     model.sampler=categorical model.sampling_steps=5 model.cfg_condition_mask_ratio=0.2 \
-    model.denoising_fn=swin_unetr model.swinunetr_type=base model.sample_mode=one_hot
+    model.denoising_fn=swin_unetr model.swinunetr_type=base model.sample_mode=one_hot \
+    model.source_val_four_conditions=true model.early_stopping_enabled=true \
+    model.early_stopping_patience=10 model.early_stopping_min_delta=0.001 \
+    model.early_stopping_min_updates=25000
+  local run_dir="${OUTPUT_ROOT}/checkpoints/acdc_nnunet/acdc_base_swinunetr"
+  if [[ -f "${run_dir}/model-best.pt" ]]; then
+    cp -f "${run_dir}/model-best.pt" "${OUTPUT_ROOT}/checkpoints/model-base.pt"
+  elif [[ -f "${run_dir}/model-final.pt" ]]; then
+    cp -f "${run_dir}/model-final.pt" "${OUTPUT_ROOT}/checkpoints/model-base.pt"
+  fi
 }
 
 train_reference() {
   "${PYTHON_BIN}" train.py \
     --config-name joint_cfg dataset=acdc_nnunet_dataset \
+    model.seed="${SEED:-0}" \
     model.diffusion_type=categorical dataset.categorical_use_background=true \
     model.categorical_aux_loss_type=dice_ce model.categorical_aux_loss_weight=1.0 \
-    model.categorical_aux_dice_weight=0.3 model.categorical_aux_ce_weight=0.7 \
+    model.categorical_aux_dice_weight=0.5 model.categorical_aux_ce_weight=0.5 \
     model.categorical_aux_boundary_weight=0.1 model.categorical_kl_loss_weight=0.1 \
     model.results_folder="${OUTPUT_ROOT}/checkpoints" \
     model.results_folder_postfix=acdc_ref_swinunetr_mini \
     model.train_num_steps="${REFERENCE_TRAIN_STEPS:-25000}" \
+    model.lr_schedule_total_steps="${REFERENCE_LR_STEPS:-100000}" \
     model.save_and_sample_every="${SAVE_EVERY:-1000}" model.timesteps=50 \
     model.train_lr="${TRAIN_LR:-1e-4}" dataset.batch_size="${REFERENCE_BATCH_SIZE:-4}" \
-    dataset.num_workers="${NUM_WORKERS:-4}" ++dataset.val_num_workers="${VAL_NUM_WORKERS:-2}" \
+    dataset.num_workers="${NUM_WORKERS:-4}" dataset.val_root_dir="" \
     model.gradient_accumulate_every="${REFERENCE_GRAD_ACCUM:-4}" \
-    model.sampler=categorical model.sampling_steps=5 model.denoising_fn=swin_unetr \
-    model.swinunetr_type=mini model.sample_mode=one_hot
+    model.sampler=categorical model.sampling_steps=5 model.cfg_condition_mask_ratio=0.2 \
+    model.denoising_fn=swin_unetr model.swinunetr_type=mini model.sample_mode=one_hot \
+    model.source_val_four_conditions=false model.early_stopping_enabled=false
+  local run_dir="${OUTPUT_ROOT}/checkpoints/acdc_nnunet/acdc_ref_swinunetr_mini"
+  if [[ -f "${run_dir}/model-final.pt" ]]; then
+    cp -f "${run_dir}/model-final.pt" "${OUTPUT_ROOT}/checkpoints/model-reference.pt"
+  fi
 }
 
 case "${ROLE}" in

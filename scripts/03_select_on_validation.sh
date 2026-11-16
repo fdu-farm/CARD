@@ -34,5 +34,5 @@ done
 
 "${PYTHON_BIN}" "${PACKAGE_ROOT}/evaluation/select_card_parameters.py" \
   --cache-root "${CACHE_ROOT}" --out-dir "${SELECTION_ROOT}" \
-  --dataset acdc --run-kind formal \
+  --dataset acdc \
   --protocol-manifest "${PACKAGE_ROOT}/metadata/card_source_val_manifest.json"

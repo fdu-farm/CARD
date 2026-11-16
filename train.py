@@ -1,7 +1,9 @@
 #!/usr/bin/env python3
 """Train primary or reference diffusion segmentation models."""
 
+import json
 import os
+import random
 import sys
 from pathlib import Path
 
@@ -9,14 +11,73 @@ PACKAGE_ROOT = Path(__file__).resolve().parent
 if str(PACKAGE_ROOT) not in sys.path:
     sys.path.insert(0, str(PACKAGE_ROOT))
 
+from dataset.source_validation_augmentation import SourceValidationAugmentationDataset, load_conditions
 from model.ddpm import CategoricalDiffusion, Trainer
-from utils.segmentation_callback import SegmentationVisualizationCallback
-from utils.channel_alignment import assert_channel_alignment
 import hydra
+import numpy as np
 from omegaconf import DictConfig, OmegaConf, open_dict
 import torch
+from torch.utils.data import DataLoader
 import importlib
 from model.denoisers import TimeAwareSwinUNETR
+
+
+def seed_all(seed: int) -> None:
+    random.seed(seed)
+    np.random.seed(seed)
+    torch.manual_seed(seed)
+    torch.cuda.manual_seed_all(seed)
+    torch.backends.cudnn.benchmark = False
+    torch.backends.cudnn.deterministic = True
+    torch.backends.cuda.matmul.allow_tf32 = False
+    torch.backends.cudnn.allow_tf32 = False
+
+
+def _build_source_validation_loaders(cfg: DictConfig, dataset_module, val_root: str):
+    manifest_path = PACKAGE_ROOT / "metadata" / "card_source_val_manifest.json"
+    manifest = json.loads(manifest_path.read_text(encoding="utf-8"))
+    seeds = [int(s) for s in manifest["datasets"]["acdc"]["seeds"]]
+    conditions = list(load_conditions())
+    if len(conditions) != len(seeds):
+        raise ValueError("Source-validation conditions and manifest seeds differ")
+
+    split_config = _resolve_to_dict(cfg.dataset.get("split_config")) or {}
+    split_config["roi_x"] = cfg.dataset.get("roi_x", 256)
+    split_config["roi_y"] = cfg.dataset.get("roi_y", 256)
+    split_config["roi_z"] = cfg.dataset.get("roi_z", 1)
+    batch_size = int(cfg.dataset.get("test_batch_size", cfg.dataset.get("batch_size", 8)))
+    num_workers = int(cfg.dataset.get("val_num_workers", 0))
+    num_fg = int(cfg.dataset.get("num_foreground_classes", 3))
+    use_bg = bool(cfg.dataset.get("categorical_use_background", True))
+    pred_sdf = bool(cfg.dataset.get("predict_background_sdf", False))
+
+    loaders = []
+    for condition, cond_seed in zip(conditions, seeds):
+        base = dataset_module.ACDC_nnUNet_Dataset(
+            root_dir=val_root,
+            mode="val",
+            stage_two=False,
+            num_foreground_classes=num_fg,
+            predict_background_sdf=pred_sdf,
+            categorical_use_background=use_bg,
+            split_config=dict(split_config),
+        )
+        wrapped = (
+            base
+            if condition == "clean"
+            else SourceValidationAugmentationDataset(base, condition, cond_seed)
+        )
+        loader = DataLoader(
+            wrapped,
+            batch_size=batch_size,
+            shuffle=False,
+            num_workers=num_workers,
+            pin_memory=True,
+            drop_last=False,
+            collate_fn=dataset_module.data_collate,
+        )
+        loaders.append((condition, loader))
+    return loaders
 
 
 def _resolve_to_dict(value):
@@ -189,6 +250,8 @@ def run(cfg: DictConfig):
 
     device = require_cuda_device(cfg.model.gpus)
     print(f"Using CUDA device: {cfg.model.gpus}")
+    if cfg.model.get('seed') is not None:
+        seed_all(int(cfg.model.seed))
 
     # Initialize model and diffusion process
     model = create_denoising_model(cfg, cfg.dataset).to(device)
@@ -233,62 +296,46 @@ def run(cfg: DictConfig):
     train_dataloader = dataset.get_loader(cfg.dataset, mode='train', stage_two=False)
     val_root_override = cfg.dataset.get('val_root_dir')
     val_dataloader = None
+    source_val_loaders = None
     if val_root_override:
-        val_dataloader = dataset.get_loader(
-            cfg.dataset, mode='val', root_override=val_root_override
-        )
-
-    _sample_for_check = next(iter(train_dataloader))
-    assert_channel_alignment(cfg, model, _sample_for_check, role='train')
-
-    # Visualization callback
-    vis_slices_cfg = cfg.model.get('vis_slices')
-    vis_slices = None
-    if vis_slices_cfg is not None:
-        if isinstance(vis_slices_cfg, (list, tuple)):
-            vis_slices = list(vis_slices_cfg)
+        if bool(cfg.model.get('source_val_four_conditions', True)):
+            source_val_loaders = _build_source_validation_loaders(cfg, dataset, val_root_override)
         else:
-            try:
-                vis_slices = list(vis_slices_cfg)
-            except TypeError:
-                vis_slices = [int(vis_slices_cfg)]
-
-    viz_callback = SegmentationVisualizationCallback(
-        save_root=cfg.model.results_folder,
-        slices=vis_slices,
-        num_slices=cfg.model.get('vis_num_slices', 3),
-        max_samples=cfg.model.get('vis_max_samples', 2),
-        overlay_alpha=cfg.model.get('vis_overlay_alpha', 0.45),
-        sampler=cfg.model.get('sampler', 'categorical'),
-        sampling_steps=cfg.model.get('sampling_steps'),
-        final_step_mode=cfg.model.get('categorical_final_step_mode', 'majority'),
-    )
+            val_dataloader = dataset.get_loader(
+                cfg.dataset, mode='val', root_override=val_root_override
+            )
 
     # Create trainer
+    lr_schedule_total_steps = cfg.model.get('lr_schedule_total_steps', cfg.model.train_num_steps)
     trainer = Trainer(
         diffusion,
         cfg=cfg,
         dataset=train_dataloader,
         validation_loader=val_dataloader,
+        source_validation_loaders=source_val_loaders,
         save_and_sample_every=cfg.model.save_and_sample_every,
         train_lr=cfg.model.train_lr,
         train_num_steps=cfg.model.train_num_steps,
+        lr_schedule_total_steps=lr_schedule_total_steps,
         gradient_accumulate_every=cfg.model.gradient_accumulate_every,
         ema_decay=cfg.model.ema_decay,
         amp=cfg.model.amp,
         results_folder=cfg.model.results_folder,
         lr_decay=True,
-        test_callback=viz_callback,
         log_dir=cfg.model.get('tensorboard_dir'),
         max_grad_norm=cfg.model.get('max_grad_norm', 2.0),
         cfg_enabled=True,
         p_uncond=condition_mask_ratio,
+        early_stopping_enabled=bool(cfg.model.get('early_stopping_enabled', False)),
+        early_stopping_patience=int(cfg.model.get('early_stopping_patience', 10)),
+        early_stopping_min_delta=float(cfg.model.get('early_stopping_min_delta', 0.001)),
+        early_stopping_min_updates=int(cfg.model.get('early_stopping_min_updates', 25000)),
     )
 
     if cfg.model.load_milestone:
         trainer.load(cfg.model.load_milestone, map_location='cpu', strict=False)
         if cfg.model.get('reset_scheduler_on_load', False) and trainer.scheduler is not None:
-            trainer.scheduler.total_steps = cfg.model.train_num_steps
+            trainer.scheduler.total_steps = int(lr_schedule_total_steps)
             trainer.scheduler.last_step = trainer.step
             lrs = trainer.scheduler.get_lr()
             for param_group, lr in zip(trainer.opt.param_groups, lrs):

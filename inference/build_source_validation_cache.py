@@ -22,6 +22,7 @@ from dataset.acdc_c_torchio_dataset import ACDC_C_TorchIO_Dataset
 from dataset.source_validation_augmentation import SourceValidationAugmentationDataset, load_conditions
 from evaluation.selection_protocol import load_protocol_manifest, validate_case_inventory
 from inference.reproduce_results import build_diffusion
+from inference.predictor_config import resolve_cardiac_predictor, sample_cardiac
 
 
 FAMILY_TO_DATASET = {"cardiac": "acdc"}
@@ -40,8 +41,8 @@ def parse_args() -> argparse.Namespace:
     parser.add_argument("--batch-size", type=int, default=4)
     parser.add_argument("--num-workers", type=int, default=2)
     parser.add_argument("--device", default="cuda")
-    parser.add_argument("--max-cases", type=int)
-    parser.add_argument("--condition", choices=list(load_conditions()))
+    parser.add_argument("--primary-cond-scale", type=float, default=None)
+    parser.add_argument("--reference-cond-scale", type=float, default=None)
     parser.add_argument(
         "--protocol-manifest",
         type=Path,
@@ -90,9 +91,7 @@ def make_dataset(family: str, preprocessed_root: Path, condition: str | None = N
             photometric_preset=config.get("preset") or "source_validation_low",
             photometric_ops="contrast,gamma,noise",
         )
-    return dataset_class(
-        **common,
-    )
+    return dataset_class(**common)
 
 
 def case_and_slice(name: str) -> tuple[str, int]:
@@ -129,7 +128,6 @@ def generate_setting(
     primary,
     reference,
     dataset,
-    condition: str,
     seed: int,
     output_dir: Path,
     args: argparse.Namespace,
@@ -147,6 +145,7 @@ def generate_setting(
     device = next(primary.parameters()).device
     current_case = None
     current_slices: list[tuple[int, np.ndarray, np.ndarray, np.ndarray]] = []
+
     with torch.inference_mode():
         for batch in loader:
             images = batch["image"].to(device)
@@ -155,15 +154,12 @@ def generate_setting(
                 images = images.squeeze(2)
             if labels.ndim == 5:
                 labels = labels.squeeze(2)
-            output = primary.sample_full_tac(
-                channel_cond=images,
-                reference_denoise_fn=reference.denoise_fn,
-                primary_cond_scale=spec["primary_scale"],
-                reference_cond_scale=spec["reference_scale"],
-                t_min=1.0,
-                t_max=1.0,
-                w_b=0.0,
-                w_k=1.0,
+            output = sample_cardiac(
+                primary,
+                reference,
+                images,
+                dict(t_min=1.0, t_max=1.0, w_b=0.0, w_k=1.0),
+                predictor=spec,
             )
             logits = output["final_logits"].float().cpu().numpy()
             agg_js = output["tac"].squeeze(1).float().cpu().numpy()
@@ -190,17 +186,13 @@ def main() -> None:
     conditions = list(load_conditions())
     if len(conditions) != len(protocol["settings"]):
         raise RuntimeError("Source-validation conditions and protocol settings differ")
-    spec = {
-        "primary_type": "base",
-        "reference_type": "mini",
-        "primary_scale": 1.0,
-        "reference_scale": 0.8,
-    }
+    spec = resolve_cardiac_predictor(
+        primary_cond_scale=args.primary_cond_scale,
+        reference_cond_scale=args.reference_cond_scale,
+    )
     _, _, num_classes, _ = FAMILY_CONFIG[args.family]
     device = torch.device(args.device)
     runs = list(zip(conditions, protocol["settings"], protocol["seeds"], strict=True))
-    if args.condition:
-        runs = [run for run in runs if run[0] == args.condition]
     primary = None
     reference = None
     inventory_checked = False
@@ -211,16 +203,10 @@ def main() -> None:
             inventory_checked = True
             primary = build_diffusion(num_classes, spec["primary_type"], args.primary_checkpoint, device)
             reference = build_diffusion(num_classes, spec["reference_type"], args.reference_checkpoint, device)
-        if args.max_cases is not None:
-            base_dataset = dataset.dataset if isinstance(dataset, SourceValidationAugmentationDataset) else dataset
-            base_dataset.file_names = base_dataset.file_names[: args.max_cases]
-            base_dataset.slice_mapping = []
-            base_dataset._scan_slices()
         generate_setting(
             primary,
             reference,
             dataset,
-            condition,
             int(seed),
             args.output_root / setting,
             args,

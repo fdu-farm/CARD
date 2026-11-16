@@ -17,8 +17,9 @@ EXPECTED_GROUPS = {
 
 
 def aggregate_display_blocks(per_case: pd.DataFrame) -> pd.DataFrame:
+    """Aggregate per-case metrics by reporting group and dataset."""
     metric_columns = ("dice", "roi_ece", "roi_sce", "roi_ace", "roi_nll")
-    required = {"display_block", "reporting_group", "case_id", *metric_columns}
+    required = {"display_block", "reporting_group", "case_id", "n_roi_pixels", *metric_columns}
     missing = sorted(required.difference(per_case.columns))
     if missing:
         raise ValueError(f"per-case metrics missing columns: {missing}")
@@ -33,10 +34,20 @@ def aggregate_display_blocks(per_case: pd.DataFrame) -> pd.DataFrame:
     if unexpected_blocks:
         raise ValueError(f"per-case metrics contain unexpected display blocks: {unexpected_blocks}")
 
+    pixels = pd.to_numeric(per_case["n_roi_pixels"], errors="raise")
+    if (not np.isfinite(pixels).all() or (pixels < 0).any()
+            or (pixels != np.floor(pixels)).any()):
+        raise ValueError("n_roi_pixels must contain nonnegative integer counts")
+    per_case["n_roi_pixels"] = pixels
     for column in metric_columns:
-        per_case[column] = pd.to_numeric(per_case[column], errors="coerce")
-    if not np.isfinite(per_case[list(metric_columns)].to_numpy()).all():
-        raise ValueError("per-case metrics contain non-finite values")
+        values = pd.to_numeric(per_case[column], errors="raise")
+        if column == "dice":
+            valid = np.isfinite(values)
+        else:
+            valid = (pixels.gt(0) & np.isfinite(values)) | (pixels.eq(0) & values.isna())
+        if not valid.all():
+            raise ValueError(f"{column} contains invalid values")
+        per_case[column] = values
 
     duplicate = per_case.duplicated(
         subset=["display_block", "reporting_group", "case_id"], keep=False
